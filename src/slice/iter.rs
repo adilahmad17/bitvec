@@ -1,8 +1,14 @@
-//! Iteration processes for `BitSlice`.
+/*! Iteration processes for `BitSlice`.
+
+The iterators [`Iter`] and [`IterMut`] were rewritten upon request by, and
+inspiration of, GitHub user [@ImmemorConsultrixContrarie].
+
+[`Iter`]: struct.Iter.html
+[`IterMut`]: struct.IterMut.html
+[@ImmemorConsultrixContrarie]: https://github.com/ImmemorConsultrixContrarie
+!*/
 
 //  TODO(myrrlyn, 2019-10-23): Upgrade to 1.37.0 and add `nth_back` impls.
-
-use super::*;
 
 use core::{
 	cmp,
@@ -12,7 +18,25 @@ use core::{
 		Formatter,
 	},
 	iter::FusedIterator,
+	marker::PhantomData,
 	mem,
+	ptr::NonNull,
+};
+
+use crate::{
+	access::BitAccess,
+	index::{
+		BitIdx,
+		Indexable,
+	},
+	mem::BitMemory,
+	order::BitOrder,
+	pointer::BitPtr,
+	slice::{
+		BitMut,
+		BitSlice,
+	},
+	store::BitStore,
 };
 
 impl<'a, O, T> IntoIterator for &'a BitSlice<O, T>
@@ -24,7 +48,17 @@ where
 	type Item = <Self::IntoIter as Iterator>::Item;
 
 	fn into_iter(self) -> Self::IntoIter {
-		Iter { inner: self }
+		let (addr, head, bits) = self.bitptr().raw_parts();
+		let addr = addr.a() as *mut _;
+		let base = unsafe { NonNull::new_unchecked(addr) };
+		let (elts, tail) = head.offset(bits as isize);
+		Self::IntoIter {
+			base,
+			last: unsafe { NonNull::new_unchecked(addr.offset(elts)) },
+			head,
+			tail,
+			_ref: PhantomData,
+		}
 	}
 }
 
@@ -52,25 +86,57 @@ for bit in bits[.. 4].iter() {
 #[derive(Clone, Debug)]
 pub struct Iter<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
-	/// The `BitSlice` undergoing iteration.
-	pub(super) inner: &'a BitSlice<O, T>,
+	/// Element address containing the first live bit.
+	base: NonNull<T::Access>,
+	/// Element address containing the first dead bit. This may not be
+	/// dereferencable.
+	last: NonNull<T::Access>,
+	/// Semantic index of the first live bit.
+	head: BitIdx<T::Mem>,
+	/// Semantic index of the first dead bit after the last live bit. This may
+	/// be in an element beyond the dereferencable range.
+	tail: BitIdx<T::Mem>,
+	/// `Iter` is semantically equivalent to a `&BitSlice`.
+	_ref: PhantomData<&'a BitSlice<O, T>>,
 }
 
 impl<'a, O, T> Iter<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
+	/// The empty iterator.
+	const EMPTY: Self = Self {
+		base: NonNull::dangling(),
+		last: NonNull::dangling(),
+		head: BitIdx {
+			idx: 0,
+			_ty: PhantomData,
+		},
+		tail: BitIdx {
+			idx: 0,
+			_ty: PhantomData,
+		},
+		_ref: PhantomData,
+	};
+
 	/// Views the underlying data as a subslice of the original data.
 	///
 	/// This has the same lifetime as the original slice, and so the iterator
 	/// can continue to be used while this exists.
 	#[inline]
 	pub fn as_bitslice(&self) -> &'a BitSlice<O, T> {
-		self.inner
+		unsafe {
+			BitPtr::new_unchecked(
+				self.base.as_ptr() as *const _ as *const _,
+				self.head,
+				self.len(),
+			)
+		}
+		.into_bitslice()
 	}
 
 	/// Views the underlying buffer.
@@ -78,22 +144,90 @@ where
 	/// This has the same rules as `BitSlice::as_slice`.
 	#[inline]
 	pub fn as_slice(&self) -> &'a [T] {
-		unsafe { &*(self.inner.as_slice() as *const [_] as *const [_]) }
+		unsafe { &*(self.as_bitslice().as_slice() as *const [_] as *const [_]) }
 	}
 
-	/// Accesses the `BitPtr` representation of the slice.
+	/// Computes the number of remaining live bits in the iterator.
+	fn inherent_len(&self) -> usize {
+		let (base, last) =
+			(self.base.as_ptr() as usize, self.last.as_ptr() as usize);
+		/* Get the number of bits in the element range `self.base .. self.last`.
+		Wrapping arithmetic is used because `last` is known to never be less
+		than `base`, so we want a bare `sub` instruction without any checks. We
+		alse know that the difference between the two addresses can support a
+		left-shift multiplication.
+		*/
+		last.wrapping_sub(base)
+			.wrapping_shl(T::Mem::INDX as u32)
+			//  Now remove the dead bits of the `base` element
+			.wrapping_sub(*self.head as usize)
+			//  And add the live bits of the `last` element
+			.wrapping_add(*self.tail as usize)
+	}
+
+	/// Tests if the iterator is empty.
 	///
-	/// # Parameters
+	/// The iterator is empty when its pointers and counters are equal.
+	fn inherent_is_empty(&self) -> bool {
+		self.base == self.last && self.head == self.tail
+	}
+
+	/// Removes the front bit from the iterator.
 	///
-	/// - `&self`
+	/// # Preconditions
+	///
+	/// The iterator must be non-empty.
 	///
 	/// # Returns
 	///
-	/// The `BitPtr` representation of the remaining slice.
-	//  The linter is incorrect; this method is absolutely used.
-	#[allow(dead_code)]
-	pub(crate) fn bitptr(&self) -> BitPtr<T> {
-		self.inner.bitptr()
+	/// The first bit of the iterator.
+	///
+	/// # Effects
+	///
+	/// The iterator’s start is moved upward one bit.
+	fn pop_front(&mut self) -> &'static bool {
+		let out =
+			BitAccess::get::<O>(unsafe { &*self.base.as_ptr() }, self.head);
+
+		//  The `base`/`head` pair always point to a live bit. They must
+		//  increment to the next live bit *after* dereferencing.
+		let next = (*self.head).wrapping_add(1);
+		self.base = unsafe{NonNull::new_unchecked(
+			self.base.as_ptr().offset((next >> T::Mem::INDX) as isize)
+		)};
+		self.head = (next & T::Mem::MASK).idx();
+
+		if out { &true } else { &false }
+	}
+
+	/// Removes the back bit from the iterator.
+	///
+	/// # Preconditions
+	///
+	/// The iterator must be non-empty.
+	///
+	/// # Returns
+	///
+	/// The last bit of the iterator.
+	///
+	/// # Effects
+	///
+	/// The iterator’s end is moved downward one bit.
+	fn pop_back(&mut self) -> &'static bool {
+		//  The `last`/`tail` pair always point to a dead bit. They must
+		//  decrement to the last live bit *before* dereferencing.
+		let prev = (*self.tail).wrapping_sub(1);
+		self.last = unsafe {NonNull::new_unchecked(
+			self.last.as_ptr().offset((prev as i8 >> T::Mem::INDX) as isize)
+		)};
+		self.tail = (prev & T::Mem::MASK).idx();
+
+		if BitAccess::get::<O>(unsafe { &*self.last.as_ptr() }, self.tail) {
+			&true
+		}
+		else {
+			&false
+		}
 	}
 }
 
@@ -106,31 +240,34 @@ where
 
 	#[inline]
 	fn next(&mut self) -> Option<Self::Item> {
-		self.inner.split_first().map(|(b, r)| {
-			self.inner = r;
-			b
-		})
+		if self.inherent_is_empty() {
+			return None;
+		}
+		Some(self.pop_front())
 	}
 
 	#[inline]
 	fn size_hint(&self) -> (usize, Option<usize>) {
-		let len = self.inner.len();
+		let len = self.inherent_len();
 		(len, Some(len))
 	}
 
 	#[inline]
 	fn count(self) -> usize {
-		self.len()
+		self.inherent_len()
 	}
 
 	#[inline]
 	fn nth(&mut self, n: usize) -> Option<Self::Item> {
-		mem::replace(&mut self.inner, BitSlice::empty())
-			.get(n ..)
-			.and_then(|s| {
-				self.inner = s;
-				self.next()
-			})
+		if n >= self.inherent_len() {
+			*self = Self::EMPTY;
+			return None;
+		}
+		let (elts, head) = self.head.offset(n as isize);
+		self.base =
+			unsafe { NonNull::new_unchecked(self.base.as_ptr().offset(elts)) };
+		self.head = head;
+		Some(self.pop_front())
 	}
 
 	#[inline]
@@ -141,15 +278,31 @@ where
 
 impl<'a, O, T> DoubleEndedIterator for Iter<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
 	#[inline]
 	fn next_back(&mut self) -> Option<Self::Item> {
-		self.inner.split_last().map(|(b, r)| {
-			self.inner = r;
-			b
-		})
+		if self.inherent_is_empty() {
+			return None;
+		}
+		Some(self.pop_back())
+	}
+
+	#[inline]
+	#[cfg(feature = "1.37.0")]
+	fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+		if n >= self.inherent_len() {
+			*self = Self::EMPTY;
+			return None;
+		}
+
+		let (elts, tail) = self.tail.offset(-(n as isize));
+		self.last =
+			unsafe { NonNull::new_unchecked(self.last.as_ptr().offset(elts)) };
+		self.tail = tail;
+
+		Some(self.pop_back())
 	}
 }
 
@@ -158,6 +311,9 @@ where
 	O: BitOrder,
 	T: BitStore,
 {
+	fn len(&self) -> usize {
+		self.inherent_len()
+	}
 }
 
 impl<O, T> FusedIterator for Iter<'_, O, T>
@@ -173,21 +329,29 @@ where
 	T: BitStore,
 {
 	fn as_ref(&self) -> &BitSlice<O, T> {
-		self.inner
+		self.as_bitslice()
 	}
 }
 
 impl<'a, O, T> IntoIterator for &'a mut BitSlice<O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
 	type IntoIter = IterMut<'a, O, T>;
 	type Item = <Self::IntoIter as Iterator>::Item;
 
 	fn into_iter(self) -> Self::IntoIter {
-		IterMut {
-			inner: self.alias_mut(),
+		let (addr, head, bits) = self.alias_mut().bitptr().raw_parts();
+		let addr = addr.a() as *mut _;
+		let base = unsafe { NonNull::new_unchecked(addr) };
+		let (elts, tail) = head.offset(bits as isize);
+		Self::IntoIter {
+			base,
+			last: unsafe { NonNull::new_unchecked(addr.offset(elts)) },
+			head,
+			tail,
+			_ref: PhantomData,
 		}
 	}
 }
@@ -222,18 +386,42 @@ assert!(bits.all());
 #[derive(Debug)]
 pub struct IterMut<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
-	/// The `BitSlice` undergoing iteration.
-	pub(super) inner: &'a mut BitSlice<O, T::Alias>,
+	/// Element address containing the first live bit.
+	base: NonNull<<T::Alias as BitStore>::Access>,
+	/// Element address containing the first dead bit. This may not be
+	/// dereferencable.
+	last: NonNull<<T::Alias as BitStore>::Access>,
+	/// Semantic index of the first live bit.
+	head: BitIdx<<T::Alias as BitStore>::Mem>,
+	/// Semantic index of the first dead bit after the last live bit. This may
+	/// be in an element beyond the dereferencable range.
+	tail: BitIdx<<T::Alias as BitStore>::Mem>,
+	/// `IterMut` is semantically equivalent to a `&mut BitSlice`.
+	_ref: PhantomData<&'a BitSlice<O, T::Alias>>,
 }
 
 impl<'a, O, T> IterMut<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
+	const EMPTY: Self = Self {
+		base: NonNull::dangling(),
+		last: NonNull::dangling(),
+		head: BitIdx {
+			idx: 0,
+			_ty: PhantomData,
+		},
+		tail: BitIdx {
+			idx: 0,
+			_ty: PhantomData,
+		},
+		_ref: PhantomData,
+	};
+
 	/// Views the underlying data as a subslice of the original data.
 	///
 	/// To avoid creating `&mut` references that alias, this is forced to
@@ -265,56 +453,116 @@ where
 	/// println!("{}", bits); // [10000000]
 	/// ```
 	pub fn into_bitslice(self) -> &'a mut BitSlice<O, T::Alias> {
-		self.inner
+		self.bitptr().into_bitslice_mut()
 	}
 
-	#[allow(dead_code)]
+	// #[allow(dead_code)]
 	pub(crate) fn bitptr(&self) -> BitPtr<T::Alias> {
-		self.inner.bitptr()
+		unsafe {
+			BitPtr::new_unchecked(
+				self.base.as_ptr() as *const _ as *const _,
+				self.head,
+				self.len(),
+			)
+		}
+	}
+
+	fn immut(&self) -> Iter<'a, O, T> {
+		Iter {
+			base: unsafe {
+				NonNull::new_unchecked(self.base.as_ptr() as *mut _)
+			},
+			last: unsafe {
+				NonNull::new_unchecked(self.last.as_ptr() as *mut _)
+			},
+			head: BitIdx {
+				idx: self.head.idx,
+				_ty: PhantomData,
+			},
+			tail: BitIdx {
+				idx: self.tail.idx,
+				_ty: PhantomData,
+			},
+			_ref: PhantomData,
+		}
+	}
+
+	fn pop_front(&mut self) -> <Self as Iterator>::Item {
+		let out = BitMut {
+			addr: self.base,
+			head: self.head,
+			data: BitAccess::get::<O>(
+				unsafe { &*self.base.as_ptr() },
+				self.head,
+			),
+			_ref: PhantomData,
+		};
+
+		let next = (*self.head).wrapping_add(1);
+		self.base = unsafe{NonNull::new_unchecked(
+			self.base.as_ptr().offset((next >> T::Mem::INDX) as isize)
+		)};
+		self.head = (next & T::Mem::MASK).idx();
+
+		out
+	}
+
+	fn pop_back(&mut self) -> <Self as Iterator>::Item {
+		let prev = (*self.tail).wrapping_sub(1);
+		self.last = unsafe {NonNull::new_unchecked(
+			self.last.as_ptr().offset((prev as i8 >> T::Mem::INDX) as isize)
+		)};
+		self.tail = (prev & T::Mem::MASK).idx();
+
+		BitMut {
+			addr: self.last,
+			head: self.tail,
+			data: BitAccess::get::<O>(
+				unsafe { &*self.last.as_ptr() },
+				self.tail,
+			),
+			_ref: PhantomData,
+		}
 	}
 }
 
 impl<'a, O, T> Iterator for IterMut<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
 	type Item = BitMut<'a, O, T::Alias>;
 
 	#[inline]
 	fn next(&mut self) -> Option<Self::Item> {
-		unsafe {
-			BitSlice::<O, T>::unalias_mut(mem::replace(
-				&mut self.inner,
-				BitSlice::empty_mut(),
-			))
+		if self.immut().inherent_is_empty() {
+			return None;
 		}
-		.split_first_mut()
-		.map(|(b, r)| {
-			self.inner = r;
-			b
-		})
+		Some(self.pop_front())
 	}
 
 	#[inline]
 	fn size_hint(&self) -> (usize, Option<usize>) {
-		let len = self.inner.len();
+		let len = self.immut().inherent_len();
 		(len, Some(len))
 	}
 
 	#[inline]
 	fn count(self) -> usize {
-		self.inner.len()
+		self.immut().inherent_len()
 	}
 
 	#[inline]
 	fn nth(&mut self, n: usize) -> Option<Self::Item> {
-		mem::replace(&mut self.inner, BitSlice::empty_mut())
-			.get_mut(n ..)
-			.and_then(|s| {
-				self.inner = s;
-				self.next()
-			})
+		if n >= self.immut().inherent_len() {
+			*self = Self::EMPTY;
+			return None;
+		}
+		let (elts, head) = self.head.offset(n as isize);
+		self.base =
+			unsafe { NonNull::new_unchecked(self.base.as_ptr().offset(elts)) };
+		self.head = head;
+		Some(self.pop_front())
 	}
 
 	#[inline]
@@ -325,22 +573,31 @@ where
 
 impl<'a, O, T> DoubleEndedIterator for IterMut<'a, O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
 	#[inline]
 	fn next_back(&mut self) -> Option<Self::Item> {
-		unsafe {
-			BitSlice::<O, T>::unalias_mut(mem::replace(
-				&mut self.inner,
-				BitSlice::empty_mut(),
-			))
+		if self.immut().inherent_is_empty() {
+			return None;
 		}
-		.split_last_mut()
-		.map(|(b, r)| {
-			self.inner = r;
-			b
-		})
+		Some(self.pop_back())
+	}
+
+	#[inline]
+	#[cfg(feature = "1.37.0")]
+	fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+		if n >= self.immut().inherent_len() {
+			*self = Self::EMPTY;
+			return None;
+		}
+
+		let (elts, tail) = self.tail.offset(-(n as isize));
+		self.last =
+			unsafe { NonNull::new_unchecked(self.last.as_ptr().offset(elts)) };
+		self.tail = tail;
+
+		Some(self.pop_back())
 	}
 }
 

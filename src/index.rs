@@ -101,9 +101,9 @@ pub struct BitIdx<M>
 where M: BitMemory
 {
 	/// Semantic index within an element. Constrained to `0 .. M::BITS`.
-	idx: u8,
+	pub(crate) idx: u8,
 	/// Marker for the indexed type.
-	_ty: PhantomData<M>,
+	pub(crate) _ty: PhantomData<M>,
 }
 
 impl<M> BitIdx<M>

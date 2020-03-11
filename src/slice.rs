@@ -1229,7 +1229,6 @@ impl_bits_for![
 
 mod api;
 pub(crate) mod iter;
-pub(crate) mod new_iter;
 mod ops;
 mod proxy;
 mod traits;

@@ -98,8 +98,8 @@ This iterator follows the ordering in the vector type, and implements
 **/
 impl<O, T> IntoIterator for BitVec<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 	type IntoIter = IntoIter<O, T>;
 	type Item = bool;
@@ -119,8 +119,10 @@ where
 	/// assert_eq!(count, 4);
 	/// ```
 	fn into_iter(self) -> Self::IntoIter {
+		let slice: &'static BitSlice<O, T> =
+			unsafe { &*(self.as_bitslice() as *const _) };
 		IntoIter {
-			region: self.pointer,
+			iter: slice.iter(),
 			bitvec: self,
 		}
 	}
@@ -317,57 +319,44 @@ where
 #[repr(C)]
 pub struct IntoIter<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 	/// Owning descriptor for the allocation. This is not modified by
 	/// iteration.
 	pub(super) bitvec: BitVec<O, T>,
 	/// Descriptor for the live portion of the vector as iteration proceeds.
-	pub(super) region: BitPtr<T>,
-}
-
-impl<O, T> IntoIter<O, T>
-where
-	O: BitOrder,
-	T: BitStore,
-{
-	fn iterator(&self) -> <&BitSlice<O, T> as IntoIterator>::IntoIter {
-		self.region.into_bitslice().into_iter()
-	}
+	pub(super) iter: <&'static BitSlice<O, T> as IntoIterator>::IntoIter,
 }
 
 impl<O, T> DoubleEndedIterator for IntoIter<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		let mut slice_iter = self.iterator();
-		let out = slice_iter.next_back().copied();
-		self.region = slice_iter.bitptr();
-		out
+		self.iter.next_back().copied()
 	}
 }
 
 impl<O, T> ExactSizeIterator for IntoIter<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 }
 
 impl<O, T> FusedIterator for IntoIter<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 }
 
 impl<O, T> Iterator for IntoIter<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 	type Item = bool;
 
@@ -393,10 +382,7 @@ where
 	/// assert!(iter.next().is_none());
 	/// ```
 	fn next(&mut self) -> Option<Self::Item> {
-		let mut slice_iter = self.iterator();
-		let out = slice_iter.next().copied();
-		self.region = slice_iter.bitptr();
-		out
+		self.iter.next().copied()
 	}
 
 	/// Hints at the number of bits remaining in the iterator.
@@ -427,7 +413,7 @@ where
 	/// assert_eq!(iter.size_hint(), (0, Some(0)));
 	/// ```
 	fn size_hint(&self) -> (usize, Option<usize>) {
-		self.iterator().size_hint()
+		self.iter.size_hint()
 	}
 
 	/// Counts how many bits are live in the iterator, consuming it.
@@ -453,7 +439,7 @@ where
 	///
 	/// [`BitSlice`]: ../struct.BitSlice.html#method.iter
 	fn count(self) -> usize {
-		self.bitvec.len()
+		self.iter.len()
 	}
 
 	/// Advances the iterator by `n` bits, starting from zero.
@@ -485,10 +471,7 @@ where
 	/// assert!(iter.nth(0).is_none());
 	/// ```
 	fn nth(&mut self, n: usize) -> Option<Self::Item> {
-		let mut slice_iter = self.iterator();
-		let out = slice_iter.nth(n).copied();
-		self.region = slice_iter.bitptr();
-		out
+		self.iter.nth(n).copied()
 	}
 
 	/// Consumes the iterator, returning only the last bit.

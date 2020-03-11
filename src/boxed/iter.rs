@@ -3,7 +3,6 @@
 use crate::{
 	boxed::BitBox,
 	order::BitOrder,
-	pointer::BitPtr,
 	slice::BitSlice,
 	store::BitStore,
 };
@@ -12,23 +11,25 @@ use core::iter::FusedIterator;
 
 impl<O, T> IntoIterator for BitBox<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 	type IntoIter = IntoIter<O, T>;
 	type Item = bool;
 
 	fn into_iter(self) -> Self::IntoIter {
+		let slice: &'static BitSlice<O, T> =
+			unsafe { &*(self.as_bitslice() as *const _) };
 		IntoIter {
-			region: self.bitptr(),
 			bitbox: self,
+			iter: slice.iter(),
 		}
 	}
 }
 
 impl<'a, O, T> IntoIterator for &'a BitBox<O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
 	type IntoIter = <&'a BitSlice<O, T> as IntoIterator>::IntoIter;
@@ -41,7 +42,7 @@ where
 
 impl<'a, O, T> IntoIterator for &'a mut BitBox<O, T>
 where
-	O: BitOrder,
+	O: 'a + BitOrder,
 	T: 'a + BitStore,
 {
 	type IntoIter = <&'a mut BitSlice<O, T> as IntoIterator>::IntoIter;
@@ -56,23 +57,13 @@ where
 #[repr(C)]
 pub struct IntoIter<O, T>
 where
-	O: BitOrder,
-	T: BitStore,
+	O: 'static + BitOrder,
+	T: 'static + BitStore,
 {
 	/// Owning pointer to the full slab
 	bitbox: BitBox<O, T>,
-	/// Slice descriptor for the region undergoing iteration.
-	region: BitPtr<T>,
-}
-
-impl<O, T> IntoIter<O, T>
-where
-	O: BitOrder,
-	T: BitStore,
-{
-	fn iterator(&self) -> <&BitSlice<O, T> as IntoIterator>::IntoIter {
-		self.region.into_bitslice().into_iter()
-	}
+	/// Interior iterator.
+	iter: <&'static BitSlice<O, T> as IntoIterator>::IntoIter,
 }
 
 impl<O, T> Iterator for IntoIter<O, T>
@@ -83,14 +74,11 @@ where
 	type Item = bool;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		let mut slice_iter = self.iterator();
-		let out = slice_iter.next().copied();
-		self.region = slice_iter.bitptr();
-		out
+		self.iter.next().copied()
 	}
 
 	fn size_hint(&self) -> (usize, Option<usize>) {
-		self.iterator().size_hint()
+		self.iter.size_hint()
 	}
 
 	fn count(self) -> usize {
@@ -98,10 +86,7 @@ where
 	}
 
 	fn nth(&mut self, n: usize) -> Option<Self::Item> {
-		let mut slice_iter = self.iterator();
-		let out = slice_iter.nth(n).copied();
-		self.region = slice_iter.bitptr();
-		out
+		self.iter.nth(n).copied()
 	}
 
 	fn last(mut self) -> Option<Self::Item> {
@@ -115,10 +100,7 @@ where
 	T: BitStore,
 {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		let mut slice_iter = self.iterator();
-		let out = slice_iter.next_back().copied();
-		self.region = slice_iter.bitptr();
-		out
+		self.iter.next_back().copied()
 	}
 }
 

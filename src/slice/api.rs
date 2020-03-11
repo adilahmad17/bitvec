@@ -2373,10 +2373,10 @@ where
 		let (offset, head) = bp.head().offset(self as isize);
 		let ptr = bp.pointer().a().offset(offset);
 		BitMut {
-			_parent: PhantomData,
-			data: NonNull::new_unchecked(ptr as *mut T::Access),
+			_ref: PhantomData,
+			addr: NonNull::new_unchecked(ptr as *mut T::Access),
 			head,
-			bit: (*ptr).get::<O>(head),
+			data: (*ptr).get::<O>(head),
 		}
 	}
 

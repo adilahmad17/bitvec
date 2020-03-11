@@ -45,19 +45,20 @@ to a location within the canonical handle, and on `Drop` writes the `Deref`
 location into referent memory, is impossible. Short of that, a C++-style thick
 reference-like type is as close as Rust will allow.
 **/
+#[repr(C)]
 pub struct BitMut<'a, O, T>
 where
 	O: BitOrder,
 	T: 'a + BitStore,
 {
-	/// Inform the compiler that this has an exclusive borrow of a `BitSlice`
-	pub(super) _parent: PhantomData<&'a mut BitSlice<O, T>>,
 	/// Typed pointer to the memory element containing the proxied bit.
-	pub(super) data: NonNull<T::Access>,
+	pub(super) addr: NonNull<T::Access>,
 	/// Index of the proxied bit inside the targeted memory element.
 	pub(super) head: BitIdx<T::Mem>,
 	/// A local cache for `Deref` usage.
-	pub(super) bit: bool,
+	pub(super) data: bool,
+	/// Inform the compiler that this has an exclusive borrow of a `BitSlice`
+	pub(super) _ref: PhantomData<&'a mut BitSlice<O, T>>,
 }
 
 impl<O, T> Deref for BitMut<'_, O, T>
@@ -68,7 +69,7 @@ where
 	type Target = bool;
 
 	fn deref(&self) -> &Self::Target {
-		&self.bit
+		&self.data
 	}
 }
 
@@ -78,7 +79,7 @@ where
 	T: BitStore,
 {
 	fn deref_mut(&mut self) -> &mut Self::Target {
-		&mut self.bit
+		&mut self.data
 	}
 }
 
@@ -88,6 +89,6 @@ where
 	T: BitStore,
 {
 	fn drop(&mut self) {
-		unsafe { (*self.data.as_ptr()).set::<O>(self.head, self.bit) }
+		unsafe { (*self.addr.as_ptr()).set::<O>(self.head, self.data) }
 	}
 }
